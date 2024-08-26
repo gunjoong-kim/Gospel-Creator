@@ -220,7 +220,7 @@ def train(seq, exp):
         num_iter_per_timestep = op.initial_step_iter if is_initial_timestep else op.not_initial_step_iter
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
-            #dynamic_gaussians.update_learning_rate(i)
+            dynamic_gaussians.update_learning_rate(i)
             curr_data = get_batch_random(todo_dataset, dataset)
             loss = get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op)
             loss.backward()
@@ -245,7 +245,7 @@ def train(seq, exp):
     
     
 if __name__=="__main__":
-    exp_name = "mlp-final-size-3"
+    exp_name = "ttest"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)

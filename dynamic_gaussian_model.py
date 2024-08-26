@@ -49,7 +49,7 @@ class DynamicGaussianModel:
                     "n_features_per_level": 2,
                     "log2_hashmap_size": model.max_hashmap,
                     "base_resolution": 16,
-                    "per_level_scale": 1.1,
+                    "per_level_scale": 1.447,
                 },
         )
         self.direction_encoding = tcnn.Encoding(
@@ -99,6 +99,13 @@ class DynamicGaussianModel:
             'means2D_gradient_accum': torch.zeros(self._xyz.shape[0]).cuda().float(),
             'denom': torch.zeros(self._xyz.shape[0]).cuda().float(),
         }
+        
+    def update_learning_rate(self, iteration):
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                lr = self.xyz_scheduler_args(iteration)
+                param_group["lr"] = lr
+                return lr
     
     def training_setup(self, op):
         self.percent_dense = op.percent_dense
@@ -134,6 +141,11 @@ class DynamicGaussianModel:
         ),
         ]
         )
+        
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init = op.position_lr_init * self.variables['scene_radius'],
+                                                    lr_final = op.position_lr_final * self.variables['scene_radius'],
+                                                    lr_delay_mult = op.position_lr_delay_mult,
+                                                    max_steps = op.position_lr_max_steps)
             
     def contract_to_unisphere(self,
         x: torch.Tensor,
