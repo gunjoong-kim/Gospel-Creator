@@ -1,0 +1,8 @@
+__pycache__/
+.idea/
+data/
+output/
+data.zip
+output.zip
+diff-gaussian-rasterization-w-depth/
+.vscode/
