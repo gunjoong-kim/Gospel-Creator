@@ -9,8 +9,8 @@ from tqdm import tqdm
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from init import ModelParams, OptimizationParams
 from dynamic_gaussian_model import DynamicGaussianModel
-from helpers import setup_camera, l1_loss_v1
-from external import calc_ssim, calc_psnr
+from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult
+from external import calc_ssim, calc_psnr, build_rotation
 # try:
 #     from torch.utils.tensorboard import SummaryWriter
 #     TENSORBOARD_FOUND = True
@@ -53,26 +53,6 @@ def get_batch_with_num(todo_dataset, dataset, num):
         todo_dataset = dataset.copy()
     curr_data = todo_dataset.pop(num)
     return curr_data
-
-def initialize_per_timestep(dynamic_gaussians):
-    pts = dynamic_gaussians._xyz
-    rot = torch.nn.functional.normalize(dynamic_gaussians._rotation)
-    new_pts = pts + (pts - dynamic_gaussians.variables["prev_pts"])
-    new_rots = torch.nn.functional.normalize(rot + (rot - dynamic_gaussians.variables["prev_rots"]))
-    
-    is_fg = dynamic_gaussians._seg_color[:, 0] > 0.5
-    prev_inv_rot_fg = rot[is_fg]
-    prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
-    fg_pts = pts[is_fg]
-    prev_offset = fg_pts[dynamic_gaussians.variables["neighbor_indices"]] - fg_pts[:, None]
-    dynamic_gaussians.variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
-    dynamic_gaussians.variables['prev_offset'] = prev_offset.detach()
-    dynamic_gaussians.variables["prev_hash"] = dynamic_gaussians.hash_table.detach()
-    dynamic_gaussians.variables["prev_mlp"] = dynamic_gaussians.mlp_head.detach()
-    dynamic_gaussians.variables["prev_pts"] = pts.detach()
-    dynamic_gaussians.variables["prev_rot"] = rot.detach()
-    
-    new_params = {"xyz": new_pts, "rotation": new_rots}
     
 def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
     losses = {}
@@ -82,16 +62,51 @@ def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
     im, radius, _, = Renderer(raster_settings = curr_data['cam'])(**rendervar)
     curr_id = curr_data['id']
     im = torch.exp(dynamic_gaussians._cam_m[curr_id])[:, None, None] * im + dynamic_gaussians._cam_c[curr_id][:, None, None]
-    losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'])) + 0.0005 * torch.mean((torch.sigmoid(dynamic_gaussians._mask)))
-    dynamic_gaussians.variables['means2D'] = rendervar['means2D']
     
+    if is_initial_timestep:
+        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im'])) + op.lambda_mask * torch.mean((torch.sigmoid(dynamic_gaussians._mask)))
+    else:
+        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))
+        
+    dynamic_gaussians.variables['means2D'] = rendervar['means2D']
     segrendervar = dynamic_gaussians.get_rendervar(curr_data['cam'])
     segrendervar['shs'] = None
     segrendervar['colors_precomp'] = dynamic_gaussians._seg_color
     seg, _, _, = Renderer(raster_settings = curr_data['cam'])(**segrendervar)
     losses['seg'] = 0.8 * l1_loss_v1(seg, curr_data['seg']) + 0.2 * (1.0 - calc_ssim(seg, curr_data['seg']))
     
-    loss = 1.0 * losses['im'] + 3.0 * losses['seg']
+    if not is_initial_timestep:
+        is_fg = (dynamic_gaussians._seg_color[:, 0] > 0.5).detach()
+        fg_pts = rendervar['means3D'][is_fg]
+        fg_rot = rendervar['rotations'][is_fg]
+        
+        rel_rot = quat_mult(fg_rot, dynamic_gaussians.variables['prev_inv_rot_fg'])
+        rot = build_rotation(rel_rot)
+        neighbor_pts = fg_pts[dynamic_gaussians.variables['neighbor_indices']]
+        curr_offset = neighbor_pts - fg_pts[:, None]
+        curr_offset_in_prev_coord = (rot.transpose(2, 1)[:, None] @ curr_offset[:, :, :, None]).squeeze(-1)
+        
+        losses['rigid'] = weighted_l2_loss_v2(curr_offset_in_prev_coord, dynamic_gaussians.variables["prev_offset"],
+                                              dynamic_gaussians.variables["neighbor_weight"])
+
+        losses['rot'] = weighted_l2_loss_v2(rel_rot[dynamic_gaussians.variables["neighbor_indices"]], rel_rot[:, None],
+                                            dynamic_gaussians.variables["neighbor_weight"])
+
+        curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
+        losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, dynamic_gaussians.variables["neighbor_dist"], dynamic_gaussians.variables["neighbor_weight"])
+
+        losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
+
+        bg_pts = rendervar['means3D'][~is_fg]
+        bg_rot = rendervar['rotations'][~is_fg]
+        losses['bg'] = l1_loss_v2(bg_pts, dynamic_gaussians.variables["init_bg_pts"]) + l1_loss_v2(bg_rot, dynamic_gaussians.variables["init_bg_rot"])
+
+        # losses['soft_col_cons'] = l1_loss_v2(dynamic_gaussians.rgb_colors'], variables["prev_col"])
+    
+    loss_weights = {'im': 1.0, 'seg': 3.0, 'rigid': 4.0, 'rot': 4.0, 'iso': 2.0, 'floor': 2.0, 'bg': 20.0,
+                    'soft_col_cons': 0.01}
+    
+    loss = sum([loss_weights[k] * v for k, v in losses.items()])
     seen = radius > 0
     dynamic_gaussians.variables['max_2D_radius'][seen] = torch.max(radius[seen], dynamic_gaussians.variables['max_2D_radius'][seen])
     dynamic_gaussians.variables['seen'] = seen
@@ -210,13 +225,13 @@ def train(seq, exp):
     dynamic_gaussians.training_setup(op)
     
     num_timesteps = len(md_train['fn'])
-    num_timesteps = 1
+    # num_timesteps = 2
     for t in range(num_timesteps):
         dataset = get_dataset(t, md_train, seq)
         todo_dataset = []
         is_initial_timestep = (t == 0)
-        # if not is_initial_timestep:
-        #     dynamic_gaussians = initialize_per_timestep(dynamic_gaussians)
+        if not is_initial_timestep:
+            dynamic_gaussians.initialize_per_timestep()
         num_iter_per_timestep = op.initial_step_iter if is_initial_timestep else op.not_initial_step_iter
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
@@ -237,6 +252,7 @@ def train(seq, exp):
         progress_bar.close()
         output_params.append(params2cpu(dynamic_gaussians, is_initial_timestep))
         if is_initial_timestep:
+            dynamic_gaussians.initialize_post_first_timestep()
             md_test = json.load(open(f"./data/{seq}/test_meta.json", "r"))
             evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
     save_params(output_params, seq, exp)
@@ -245,7 +261,7 @@ def train(seq, exp):
     
     
 if __name__=="__main__":
-    exp_name = "ttest"
+    exp_name = "tttest"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)

@@ -358,6 +358,48 @@ class DynamicGaussianModel:
                 to_prune = torch.logical_or(to_prune, big_points_ws)
             self.prune_points(to_prune)
             torch.cuda.empty_cache()
+            
+    def initialize_post_first_timestep(self, num_knn=20):
+        is_fg = self._seg_color[:, 0] > 0.5
+        init_fg_pts = self._xyz[is_fg]
+        init_bg_pts = self._xyz[~is_fg]
+        init_bg_rot = torch.nn.functional.normalize(self._rotation[~is_fg])
+        neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn)
+        neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
+        neighbor_dist = np.sqrt(neighbor_sq_dist)
+        self.variables["neighbor_indices"] = torch.tensor(neighbor_indices).cuda().long().contiguous()
+        self.variables["neighbor_weight"] = torch.tensor(neighbor_weight).cuda().float().contiguous()
+        self.variables["neighbor_dist"] = torch.tensor(neighbor_dist).cuda().float().contiguous()
+    
+        self.variables["init_bg_pts"] = init_bg_pts.detach()
+        self.variables["init_bg_rot"] = init_bg_rot.detach()
+        self.variables["prev_pts"] = self._xyz.detach()
+        self.variables["prev_rots"] = torch.nn.functional.normalize(self._rotation).detach()
+        params_to_fix = ['opacity', 'scaling', 'cam_m', 'cam_c', 'mask']
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] in params_to_fix:
+                param_group['lr'] = 0.0
+            
+    def initialize_per_timestep(self):
+        pts = self._xyz
+        rot = torch.nn.functional.normalize(self._rotation)
+        new_pts = pts + (pts - self.variables["prev_pts"])
+        new_rots = torch.nn.functional.normalize(rot + (rot - self.variables["prev_rots"]))
+
+        is_fg = self._seg_color[:, 0] > 0.5
+        prev_inv_rot_fg = rot[is_fg]
+        prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
+        fg_pts = pts[is_fg]
+        prev_offset = fg_pts[self.variables["neighbor_indices"]] - fg_pts[:, None]
+        self.variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
+        self.variables['prev_offset'] = prev_offset.detach()
+        # self.variables["prev_hash"] = self.hash_table.detach()
+        # self.variables["prev_mlp"] = self.mlp_head.detach()
+        self.variables["prev_pts"] = pts.detach()
+        self.variables["prev_rots"] = rot.detach()
+
+        self.replace_tensor_to_optimizer(new_pts, "xyz")
+        self.replace_tensor_to_optimizer(new_rots, "rotation")
                 
                 
                 
