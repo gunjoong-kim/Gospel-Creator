@@ -261,7 +261,7 @@ def train(seq, exp):
     
     
 if __name__=="__main__":
-    exp_name = "tttest"
+    exp_name = "dynamic-test"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)
