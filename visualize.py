@@ -50,6 +50,7 @@ def load_scene_data(seq, exp, seg_as_col=False):
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
     is_fg = params['seg_color'][:, 0] > 0.5
     scene_data = []
+    color_data = []
     for t in range(len(params['xyz'])):
         recolor = tcnn.Encoding(
                  n_input_dims=3,
@@ -88,17 +89,20 @@ def load_scene_data(seq, exp, seg_as_col=False):
             'rotations': torch.nn.functional.normalize(params['rotation'][t]),
             'opacities': torch.sigmoid(params['opacity'][t]),
             'scales': torch.exp(params['scaling'][t]),
-            'means2D': torch.zeros_like(params['xyz'][0], device="cuda"),
+            'means2D': torch.zeros_like(params['xyz'][0], device="cuda")
+        }
+        colorvar = {
             'mlp_head': mlp_head,
             'recolor': recolor,
-            "direction_encoding": direction_encoding,
+            "direction_encoding": direction_encoding
         }
         if REMOVE_BACKGROUND:
             rendervar = {k: v[is_fg] for k, v in rendervar.items()}
         scene_data.append(rendervar)
+        color_data.append(colorvar)
     if REMOVE_BACKGROUND:
         is_fg = is_fg[is_fg]
-    return scene_data, is_fg
+    return scene_data, color_data, is_fg
 
 
 def make_lineset(all_pts, cols, num_lines):
@@ -166,16 +170,13 @@ def contract_to_unisphere(
             x = x / 4 + 0.5  # [-inf, inf] is at [0, 1]
             return x
 
-def render(w2c, k, timestep_data):
+def render(w2c, k, timestep_data, color_data):
     with torch.no_grad():
         cam = setup_camera(w, h, k, w2c, near, far)
         dir_pp = (timestep_data["means3D"] - cam.campos.repeat(timestep_data["means3D"].shape[0], 1))
         dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         xyz = contract_to_unisphere(timestep_data["means3D"].clone().detach(), torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
-        timestep_data["shs"] = (timestep_data["mlp_head"])(torch.cat([timestep_data["recolor"](xyz), timestep_data["direction_encoding"](dir_pp)], dim=-1)).unsqueeze(1).float()
-        del timestep_data["recolor"]
-        del timestep_data["direction_encoding"]
-        del timestep_data["mlp_head"]
+        timestep_data["shs"] = (color_data["mlp_head"])(torch.cat([color_data["recolor"](xyz), color_data["direction_encoding"](dir_pp)], dim=-1)).unsqueeze(1).float()
         im, _, depth, = Renderer(raster_settings=cam)(**timestep_data)
         return im, depth
 
@@ -204,13 +205,13 @@ def rgbd2pcd(im, depth, w2c, k, show_depth=False, project_to_cam_w_scale=None):
 
 
 def visualize(seq, exp):
-    scene_data, is_fg = load_scene_data(seq, exp)
+    scene_data, color_data, is_fg = load_scene_data(seq, exp)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
 
     w2c, k = init_camera()
-    im, depth = render(w2c, k, scene_data[0])
+    im, depth = render(w2c, k, scene_data[0], color_data[0])
     init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
     pcd = o3d.geometry.PointCloud()
     pcd.points = init_pts
@@ -272,7 +273,7 @@ def visualize(seq, exp):
             pts = o3d.utility.Vector3dVector(scene_data[t]['means3D'].contiguous().double().cpu().numpy())
             cols = o3d.utility.Vector3dVector(scene_data[t]['colors_precomp'].contiguous().double().cpu().numpy())
         else:
-            im, depth = render(w2c, k, scene_data[t])
+            im, depth = render(w2c, k, scene_data[t], color_data[t])
             pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
         pcd.points = pts
         pcd.colors = cols
@@ -299,6 +300,6 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "tttest"
+    exp_name = "dynamic-test"
     for sequence in ["basketball"]:
         visualize(sequence, exp_name)
