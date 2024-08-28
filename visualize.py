@@ -300,6 +300,6 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "dynamic-test"
+    exp_name = "dynamic-test6"
     for sequence in ["basketball"]:
         visualize(sequence, exp_name)

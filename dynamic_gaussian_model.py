@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 from torch import nn
-import os
 import tinycudann as tcnn
 
 from utils.general_utils import build_scaling_rotation, strip_symmetric, inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -22,7 +21,7 @@ class DynamicGaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, model):
+    def __init__(self, model_params):
         self.active_sh_degree = 0
         self.max_sh_degree = 0
         self._xyz = torch.empty(0)
@@ -47,7 +46,7 @@ class DynamicGaussianModel:
                     "otype": "HashGrid",
                     "n_levels": 16,
                     "n_features_per_level": 2,
-                    "log2_hashmap_size": model.max_hashmap,
+                    "log2_hashmap_size": model_params.max_hashmap,
                     "base_resolution": 16,
                     "per_level_scale": 1.447,
                 },
@@ -70,10 +69,6 @@ class DynamicGaussianModel:
                     "n_hidden_layers": 2,
                 },
             )
-        
-    def oneUpSHdegree(self):
-        if self.active_sh_degree < self.max_sh_degree:
-            self.active_sh_degree += 1
             
     def load_initial_pt_cld_and_init(self, seq, md):
         init_pt_cld = np.load(f"./data/{seq}/init_pt_cld.npz")["data"]
@@ -99,13 +94,6 @@ class DynamicGaussianModel:
             'means2D_gradient_accum': torch.zeros(self._xyz.shape[0]).cuda().float(),
             'denom': torch.zeros(self._xyz.shape[0]).cuda().float(),
         }
-        
-    def update_learning_rate(self, iteration):
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group["lr"] = lr
-                return lr
     
     def training_setup(self, op):
         self.percent_dense = op.percent_dense
@@ -146,6 +134,13 @@ class DynamicGaussianModel:
                                                     lr_final = op.position_lr_final * self.variables['scene_radius'],
                                                     lr_delay_mult = op.position_lr_delay_mult,
                                                     max_steps = op.position_lr_max_steps)
+        
+    def update_learning_rate(self, iteration):
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "xyz":
+                lr = self.xyz_scheduler_args(iteration)
+                param_group["lr"] = lr
+                return lr
             
     def contract_to_unisphere(self,
         x: torch.Tensor,
@@ -247,18 +242,6 @@ class DynamicGaussianModel:
         self.variables['means2D_gradient_accum'] = torch.zeros(self._xyz.shape[0], device="cuda")
         self.variables['denom'] = torch.zeros(self._xyz.shape[0], device="cuda")
         self.variables['max_2D_radius'] = torch.zeros(self._xyz.shape[0], device="cuda")
-
-    def clone(self, grads, grad_threshold):
-        to_clone = torch.logical_and(grads >= grad_threshold, (torch.max(torch.exp(self._scaling), dim=1).values <= 0.01 * self.variables['scene_radius']))
-        
-        new_xyz = self._xyz[to_clone]
-        new_scaling = self._scaling[to_clone]
-        new_rotation = self._rotation[to_clone]
-        new_opacity = self._opacity[to_clone]
-        new_mask = self._mask[to_clone]
-        new_seg_color = self._seg_color[to_clone]
-        
-        self.densification_postfix(new_xyz, new_scaling, new_rotation, new_opacity, new_mask, new_seg_color)
         
     def prune_optimizer(self, to_prune):
         optimizable_tensors = {}
@@ -296,8 +279,18 @@ class DynamicGaussianModel:
         self.variables['denom'] = self.variables['denom'][to_keep]
         self.variables['max_2D_radius'] = self.variables['max_2D_radius'][to_keep]
         
+    def clone(self, grads, grad_threshold):
+        to_clone = torch.logical_and(grads >= grad_threshold, (torch.max(torch.exp(self._scaling), dim=1).values <= 0.01 * self.variables['scene_radius']))
         
+        new_xyz = self._xyz[to_clone]
+        new_scaling = self._scaling[to_clone]
+        new_rotation = self._rotation[to_clone]
+        new_opacity = self._opacity[to_clone]
+        new_mask = self._mask[to_clone]
+        new_seg_color = self._seg_color[to_clone]
         
+        self.densification_postfix(new_xyz, new_scaling, new_rotation, new_opacity, new_mask, new_seg_color)    
+    
     def split(self, grads, grad_threshold, N=2):
         n_init_points = self._xyz.shape[0]
         padded_grads = torch.zeros((n_init_points), device="cuda")
@@ -321,12 +314,6 @@ class DynamicGaussianModel:
         to_prune = torch.cat((to_split, torch.zeros(N * to_split.sum(), dtype=torch.bool, device="cuda")))
         self.prune_points(to_prune)
         
-    def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self._opacity, torch.ones_like(self._opacity) * 0.01))
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self._opacity = optimizable_tensors["opacity"]
-        
-    
     def densify_with_learnable_mask(self, iteration, op):
         if iteration <= op.densify_until_iter:
             self.variables['means2D_gradient_accum'][self.variables['seen']] += torch.norm(self.variables['means2D'].grad[self.variables['seen'], :2], dim=-1)
@@ -358,6 +345,11 @@ class DynamicGaussianModel:
                 to_prune = torch.logical_or(to_prune, big_points_ws)
             self.prune_points(to_prune)
             torch.cuda.empty_cache()
+            
+    def reset_opacity(self):
+        opacities_new = inverse_sigmoid(torch.min(self._opacity, torch.ones_like(self._opacity) * 0.01))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
             
     def initialize_post_first_timestep(self, num_knn=20):
         is_fg = self._seg_color[:, 0] > 0.5
@@ -402,6 +394,20 @@ class DynamicGaussianModel:
         self._xyz = optimizable_tensor["xyz"]
         optimizable_tensor = self.replace_tensor_to_optimizer(new_rots, "rotation")
         self._rotation = optimizable_tensor["rotation"]
+        
+    def capture(self):
+        return {
+            'xyz': self._xyz.detach().cpu().contiguous().numpy(),
+            'rotation': self._rotation.detach().cpu().contiguous().numpy(),
+            'scaling': self._scaling.detach().cpu().contiguous().numpy(),
+            'rotation': self._rotation.detach().cpu().contiguous().numpy(),
+            'seg_color': self._seg_color.detach().cpu().contiguous().numpy(),
+            'opacity': self._opacity.detach().cpu().contiguous().numpy(),
+            'cam_m': self._cam_m.detach().cpu().contiguous().numpy(),
+            'cam_c': self._cam_c.detach().cpu().contiguous().numpy(),
+            'hash_table': self.hash_table.params.detach().cpu().half().numpy(),
+            'mlp_head': self.mlp_head.params.detach().cpu().half().numpy(),
+        }
                 
                 
                 

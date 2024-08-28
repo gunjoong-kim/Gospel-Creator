@@ -147,7 +147,6 @@ def evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, e
     dataset = get_dataset(t, md_train, seq)
     todo_dataset = []
     total_train_psnr = 0
-    train_image_list = [5, 10, 15, 20]
     for c in range(len(md_train['fn'][0])):
         cur_data = get_batch_with_num(todo_dataset, dataset, c)
         im, _, _, = Renderer(raster_settings=cur_data['cam'])(**rendervar)
@@ -155,36 +154,13 @@ def evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, e
         im = torch.exp(dynamic_gaussians._cam_m[curr_id])[:, None, None] * im + dynamic_gaussians._cam_c[curr_id][:, None, None]
         current_psnr = calc_psnr(im, cur_data['im']).mean()
         total_train_psnr += current_psnr
-        if c in train_image_list:
-            # save image
-            im = (im - im.min()) / (im.max() - im.min())
-            im = im.detach().squeeze().cpu().numpy() * 255
-            im = im.astype(np.uint8).transpose(1, 2, 0)
-            Image.fromarray(im).save(f"./output/{exp}/{seq}/{t}_train_{curr_id}.png")
-            print(f"Train PSNR at camera {curr_id}: {current_psnr}")
 
     print(f"\n")
-    print(f"-------------------first timestep evaluation-------------------")
+    print(f"-------------------timestep : {t} evaluation-------------------")
     print(f"Average Test PSNR: {total_test_psnr / len(md_test['fn'][0])}")
     print(f"Average Train PSNR: {total_train_psnr / len(md_train['fn'][0])}")
-    print(f"Number of Gaussians : {dynamic_gaussians._xyz.shape[0]}")
     print(f"---------------------------------------------------------------")
     print(f"\n")
-    
-def params2cpu(dynamic_gaussians, is_initial_timestep):
-    res = {
-            'xyz': dynamic_gaussians._xyz.detach().cpu().contiguous().numpy(),
-            'rotation': dynamic_gaussians._rotation.detach().cpu().contiguous().numpy(),
-            'scaling': dynamic_gaussians._scaling.detach().cpu().contiguous().numpy(),
-            'rotation': dynamic_gaussians._rotation.detach().cpu().contiguous().numpy(),
-            'seg_color': dynamic_gaussians._seg_color.detach().cpu().contiguous().numpy(),
-            'opacity': dynamic_gaussians._opacity.detach().cpu().contiguous().numpy(),
-            'cam_m': dynamic_gaussians._cam_m.detach().cpu().contiguous().numpy(),
-            'cam_c': dynamic_gaussians._cam_c.detach().cpu().contiguous().numpy(),
-            'hash_table': dynamic_gaussians.hash_table.params.detach().cpu().half().numpy(),
-            'mlp_head': dynamic_gaussians.mlp_head.params.detach().cpu().half().numpy(),
-        }
-    return res
 
 def save_params(output_params, seq, exp):
     to_save = {}
@@ -200,12 +176,16 @@ def train(seq, exp):
     output_params = []
     mp = ModelParams()
     op = OptimizationParams()
+
     if os.path.exists(f"./output/{exp}/{seq}"):
         print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
         return
     
+    # metadata loading
     md_train = json.load(open(f"./data/{seq}/train_meta.json", "r"))
+    md_test = json.load(open(f"./data/{seq}/test_meta.json", "r"))
 
+    # model initialization
     dynamic_gaussians = DynamicGaussianModel(mp)
     dynamic_gaussians.load_initial_pt_cld_and_init(seq, md_train)
     dynamic_gaussians.training_setup(op)
@@ -235,11 +215,11 @@ def train(seq, exp):
                 dynamic_gaussians.optimizer_net.step()
                 dynamic_gaussians.optimizer_net.zero_grad(set_to_none = True)
                 dynamic_gaussians.scheduler_net.step()
-        progress_bar.close()
-        output_params.append(params2cpu(dynamic_gaussians, is_initial_timestep))
         if is_initial_timestep:
             dynamic_gaussians.initialize_post_first_timestep()
-            md_test = json.load(open(f"./data/{seq}/test_meta.json", "r"))
+        
+        progress_bar.close()
+        output_params.append(dynamic_gaussians.capture())
         evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
     save_params(output_params, seq, exp)
     

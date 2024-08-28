@@ -30,33 +30,6 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
     )
     return cam
 
-
-def params2rendervar(params):
-    rendervar = {
-        'means3D': params['means3D'],
-        'rotations': torch.nn.functional.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(params['log_scales']),
-        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0,
-        'shs' : params['sh_coeffs']
-        # 'shs' : torch.cat((params['rgb_colors'], params['sh_coeffs']), dim = 1)
-    }
-    return rendervar
-        #'colors_precomp': params['rgb_colors'],
-        
-def params2rendervar_seg(params):
-    rendervar = {
-        'means3D': params['means3D'],
-        'rotations': torch.nn.functional.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(params['log_scales']),
-        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0,
-        'colors_precomp' : params['sh_coeffs']
-        # 'colors_precomp': params['rgb_colors'],
-    }
-    return rendervar
-
-
 def l1_loss_v1(x, y):
     return torch.abs((x - y)).mean()
 
@@ -94,43 +67,3 @@ def o3d_knn(pts, num_knn):
         indices.append(i[1:])
         sq_dists.append(d[1:])
     return np.array(sq_dists), np.array(indices)
-
-
-def params2cpu(params, is_initial_timestep):
-    if is_initial_timestep:
-        res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items() if
-               k not in ['mask']}
-    else:
-        res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items() if
-            k in ['means3D', 'unnorm_rotations' , 'sh_coeffs']}
-            #    k in ['means3D', 'rgb_colors', 'unnorm_rotations' , 'sh_coeffs']}
-    return res
-
-
-def save_params(output_params, seq, exp):
-    to_save = {}
-    for k in output_params[0].keys():
-        if k in output_params[1].keys():
-            to_save[k] = np.stack([params[k] for params in output_params])
-        else:
-            to_save[k] = output_params[0][k]
-    os.makedirs(f"./output/{exp}/{seq}", exist_ok=True)
-    np.savez(f"./output/{exp}/{seq}/params", **to_save)
-    
-def save_params_with_sh(output_params, seq, exp):
-    to_save = {}
-    for k in output_params[0].keys():
-        if k in output_params[1].keys():
-            if k == 'rgb_colors':
-                stacked_rgb = np.stack([params['rgb_colors'] for params in output_params])
-                stacked_sh = np.stack([params['sh_coeffs'] for params in output_params])
-                shs = torch.cat((torch.tensor(stacked_rgb), torch.tensor(stacked_sh)), dim=-1)
-                to_save['shs'] = shs.numpy()
-            elif k not in ['sh_coeffs']:
-                to_save[k] = np.stack([params[k] for params in output_params])
-        else:
-            if k not in ['rgb_colors', 'sh_coeffs']:
-                to_save[k] = output_params[0][k]
-    
-    os.makedirs(f"./output/{exp}/{seq}", exist_ok=True)
-    np.savez(f"./output/{exp}/{seq}/params", **to_save)
