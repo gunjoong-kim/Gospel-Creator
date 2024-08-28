@@ -79,10 +79,10 @@ def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
         is_fg = (dynamic_gaussians._seg_color[:, 0] > 0.5).detach()
         fg_pts = rendervar['means3D'][is_fg]
         fg_rot = rendervar['rotations'][is_fg]
-        
-        rel_rot = quat_mult(fg_rot, dynamic_gaussians.variables['prev_inv_rot_fg'])
+
+        rel_rot = quat_mult(fg_rot, dynamic_gaussians.variables["prev_inv_rot_fg"])
         rot = build_rotation(rel_rot)
-        neighbor_pts = fg_pts[dynamic_gaussians.variables['neighbor_indices']]
+        neighbor_pts = fg_pts[dynamic_gaussians.variables["neighbor_indices"]]
         curr_offset = neighbor_pts - fg_pts[:, None]
         curr_offset_in_prev_coord = (rot.transpose(2, 1)[:, None] @ curr_offset[:, :, :, None]).squeeze(-1)
         
@@ -101,7 +101,7 @@ def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
         bg_rot = rendervar['rotations'][~is_fg]
         losses['bg'] = l1_loss_v2(bg_pts, dynamic_gaussians.variables["init_bg_pts"]) + l1_loss_v2(bg_rot, dynamic_gaussians.variables["init_bg_rot"])
 
-        # losses['soft_col_cons'] = l1_loss_v2(dynamic_gaussians.rgb_colors'], variables["prev_col"])
+        losses['soft_col_cons'] = l1_loss_v2(dynamic_gaussians.hash_table.params.clone().detach(), dynamic_gaussians.variables['prev_hash']) + l1_loss_v2(dynamic_gaussians.mlp_head.params.clone().detach(), dynamic_gaussians.variables['prev_mlp'])
     
     loss_weights = {'im': 1.0, 'seg': 3.0, 'rigid': 4.0, 'rot': 4.0, 'iso': 2.0, 'floor': 2.0, 'bg': 20.0,
                     'soft_col_cons': 0.01}
@@ -125,7 +125,7 @@ def report_progress(dynamic_gaussians, data, i, progress_bar, every_i=100):
         
 def evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp):
     os.makedirs(f"./output/{exp}/{seq}", exist_ok=True)
-    dataset = get_test_dataset(0, md_test, seq)
+    dataset = get_test_dataset(t, md_test, seq)
     todo_dataset = []
     total_test_psnr = 0
     for c in range(len(md_test['fn'][0])):
@@ -144,7 +144,7 @@ def evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, e
         print(f"Test PSNR at camera {curr_id}: {current_psnr}")
         total_test_psnr += current_psnr
     
-    dataset = get_dataset(0, md_train, seq)
+    dataset = get_dataset(t, md_train, seq)
     todo_dataset = []
     total_train_psnr = 0
     train_image_list = [5, 10, 15, 20]
@@ -172,21 +172,7 @@ def evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, e
     print(f"\n")
     
 def params2cpu(dynamic_gaussians, is_initial_timestep):
-    if is_initial_timestep:
-        res = {
-            'xyz': dynamic_gaussians._xyz.detach().cpu().contiguous().numpy(),
-            'rotation': dynamic_gaussians._rotation.detach().cpu().contiguous().numpy(),
-            'scaling': dynamic_gaussians._scaling.detach().cpu().contiguous().numpy(),
-            'rotation': dynamic_gaussians._rotation.detach().cpu().contiguous().numpy(),
-            'seg_color': dynamic_gaussians._seg_color.detach().cpu().contiguous().numpy(),
-            'opacity': dynamic_gaussians._opacity.detach().cpu().contiguous().numpy(),
-            'cam_m': dynamic_gaussians._cam_m.detach().cpu().contiguous().numpy(),
-            'cam_c': dynamic_gaussians._cam_c.detach().cpu().contiguous().numpy(),
-            'hash_table': dynamic_gaussians.hash_table.params.detach().cpu().half().numpy(),
-            'mlp_head': dynamic_gaussians.mlp_head.params.detach().cpu().half().numpy(),
-        }
-    else:
-        res = {
+    res = {
             'xyz': dynamic_gaussians._xyz.detach().cpu().contiguous().numpy(),
             'rotation': dynamic_gaussians._rotation.detach().cpu().contiguous().numpy(),
             'scaling': dynamic_gaussians._scaling.detach().cpu().contiguous().numpy(),
@@ -225,7 +211,7 @@ def train(seq, exp):
     dynamic_gaussians.training_setup(op)
     
     num_timesteps = len(md_train['fn'])
-    # num_timesteps = 2
+    num_timesteps = 30
     for t in range(num_timesteps):
         dataset = get_dataset(t, md_train, seq)
         todo_dataset = []
@@ -235,7 +221,7 @@ def train(seq, exp):
         num_iter_per_timestep = op.initial_step_iter if is_initial_timestep else op.not_initial_step_iter
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
-            dynamic_gaussians.update_learning_rate(i)
+            #dynamic_gaussians.update_learning_rate(i)
             curr_data = get_batch_random(todo_dataset, dataset)
             loss = get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op)
             loss.backward()
@@ -254,14 +240,14 @@ def train(seq, exp):
         if is_initial_timestep:
             dynamic_gaussians.initialize_post_first_timestep()
             md_test = json.load(open(f"./data/{seq}/test_meta.json", "r"))
-            evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
+        evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
     save_params(output_params, seq, exp)
     
     
     
     
 if __name__=="__main__":
-    exp_name = "dynamic-test"
+    exp_name = "dynamic-test6"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)

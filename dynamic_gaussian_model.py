@@ -393,13 +393,15 @@ class DynamicGaussianModel:
         prev_offset = fg_pts[self.variables["neighbor_indices"]] - fg_pts[:, None]
         self.variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
         self.variables['prev_offset'] = prev_offset.detach()
-        # self.variables["prev_hash"] = self.hash_table.detach()
-        # self.variables["prev_mlp"] = self.mlp_head.detach()
+        self.variables["prev_hash"] = self.hash_table.params.detach()
+        self.variables["prev_mlp"] = self.mlp_head.params.detach()
         self.variables["prev_pts"] = pts.detach()
         self.variables["prev_rots"] = rot.detach()
 
-        self.replace_tensor_to_optimizer(new_pts, "xyz")
-        self.replace_tensor_to_optimizer(new_rots, "rotation")
+        optimizable_tensor = self.replace_tensor_to_optimizer(new_pts, "xyz")
+        self._xyz = optimizable_tensor["xyz"]
+        optimizable_tensor = self.replace_tensor_to_optimizer(new_rots, "rotation")
+        self._rotation = optimizable_tensor["rotation"]
                 
                 
                 
