@@ -57,19 +57,20 @@ def get_batch_with_num(todo_dataset, dataset, num):
 def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
     losses = {}
     
-    rendervar = dynamic_gaussians.get_rendervar(curr_data['cam'])
+    rendervar = dynamic_gaussians.get_rendervar(curr_data['cam'], is_initial_timestep)
     rendervar['means2D'].retain_grad()
     im, radius, _, = Renderer(raster_settings = curr_data['cam'])(**rendervar)
     curr_id = curr_data['id']
     im = torch.exp(dynamic_gaussians._cam_m[curr_id])[:, None, None] * im + dynamic_gaussians._cam_c[curr_id][:, None, None]
     
-    if is_initial_timestep:
-        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im'])) + op.lambda_mask * torch.mean((torch.sigmoid(dynamic_gaussians._mask)))
-    else:
-        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))
-        
+    # if is_initial_timestep:
+    #     losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im'])) + op.lambda_mask * torch.mean((torch.sigmoid(dynamic_gaussians._mask)))
+    # else:
+    #     losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))
+    losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))    
+    
     dynamic_gaussians.variables['means2D'] = rendervar['means2D']
-    segrendervar = dynamic_gaussians.get_rendervar(curr_data['cam'])
+    segrendervar = dynamic_gaussians.get_rendervar(curr_data['cam'], is_initial_timestep)
     segrendervar['shs'] = None
     segrendervar['colors_precomp'] = dynamic_gaussians._seg_color
     seg, _, _, = Renderer(raster_settings = curr_data['cam'])(**segrendervar)
@@ -191,7 +192,7 @@ def train(seq, exp):
     dynamic_gaussians.training_setup(op)
     
     num_timesteps = len(md_train['fn'])
-    num_timesteps = 30
+    num_timesteps = 10
     for t in range(num_timesteps):
         dataset = get_dataset(t, md_train, seq)
         todo_dataset = []
@@ -223,11 +224,11 @@ def train(seq, exp):
         evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
     save_params(output_params, seq, exp)
     
-    
+
     
     
 if __name__=="__main__":
-    exp_name = "dynamic-test6"
+    exp_name = "compensate-test"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)

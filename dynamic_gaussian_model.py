@@ -6,6 +6,31 @@ import tinycudann as tcnn
 from utils.general_utils import build_scaling_rotation, strip_symmetric, inverse_sigmoid, get_expon_lr_func, build_rotation
 from helpers import o3d_knn
 
+
+def hash(coords, hashmap_size):
+    '''
+    coords: Nx3 tensor representing normalized 3D coordinates (in range [-1, 1])
+    hashmap_size: size of the hash map N
+    '''
+    # Define prime numbers for hashing
+    primes = torch.tensor([1, 2654435761, 805459861], device=coords.device)
+
+    # Normalize coordinates from [-1, 1] to [0, hashmap_size - 1]
+    normalized_coords = ((coords + 1.0) / 2.0) * (hashmap_size - 1)
+    
+    # Convert normalized coordinates to long type for bitwise operations
+    normalized_coords = normalized_coords.long()
+
+    # Initialize hash value to zero
+    hash_value = torch.zeros_like(normalized_coords[..., 0])
+
+    # Compute the hash using XOR and prime numbers
+    for i in range(3):  # Loop over x, y, z dimensions
+        hash_value ^= normalized_coords[..., i] * primes[i]
+
+    # Apply mod operation to map within hashmap_size
+    return hash_value % hashmap_size
+
 class DynamicGaussianModel:
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -40,6 +65,7 @@ class DynamicGaussianModel:
         
         self.setup_functions()
         
+        self.compensate = torch.empty(0)
         self.hash_table = tcnn.Encoding(
                  n_input_dims=3,
                  encoding_config={
@@ -86,6 +112,10 @@ class DynamicGaussianModel:
         self._cam_c = nn.Parameter(torch.tensor(np.zeros((max_cams, 3))).cuda().float().contiguous().requires_grad_(True))
         self._mask = nn.Parameter(torch.tensor(np.ones((seg.shape[0], 1))).cuda().float().contiguous().requires_grad_(True))
         
+        # for compensation
+        # log2_hashmap_size = 14
+        self.campensate = nn.Parameter(torch.tensor(np.zeros((16384, 32))).cuda().float().contiguous().requires_grad_(True))
+        
         cam_centers = np.linalg.inv(md["w2c"][0])[:, :3, 3]
         scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
         self.variables = {
@@ -99,10 +129,12 @@ class DynamicGaussianModel:
         self.percent_dense = op.percent_dense
         
         other_params = []
-        for params in self.hash_table.parameters():
-            other_params.append(params)
+        # for params in self.hash_table.parameters():
+        #     other_params.append(params)
         for params in self.mlp_head.parameters():
             other_params.append(params)
+            
+        hash_table_params = list(self.hash_table.parameters())
             
         l = [
             {'params': [self._xyz], 'lr': op.position_lr * self.variables['scene_radius'], "name": "xyz"},
@@ -113,7 +145,12 @@ class DynamicGaussianModel:
             {'params': [self._seg_color], 'lr': op.seg_lr, "name": "seg_color"},
             {'params': [self._cam_m], 'lr': op.cam_m_lr, "name": "cam_m"},
             {'params': [self._cam_c], 'lr': op.cam_c_lr, "name": "cam_c"},
+            # for compensation
+            {'params': [self.campensate], 'lr': 0.0, "name": "compensate"},
         ]
+        
+        hash_table_lr_groups = {'params': hash_table_params, 'lr': op.net_lr, "name": "hash_table"}
+        l.append(hash_table_lr_groups)
         
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.optimizer_net = torch.optim.Adam(other_params, lr=op.net_lr, eps=1e-15)
@@ -166,19 +203,33 @@ class DynamicGaussianModel:
             x[mask] = (2 - 1 / mag[mask]) * (x[mask] / mag[mask])
             x = x / 4 + 0.5  # [-inf, inf] is at [0, 1]
             return x
+        
+    def get_compensate(self, xyz):
+        hash_vals = hash(xyz, 16384)
+        return self.campensate[hash_vals]
             
-    def get_rendervar(self, cam):
+    def get_rendervar(self, cam, is_initial_timestep=False):
         dir_pp = (self._xyz - cam.campos.repeat(self._xyz.shape[0], 1))
         dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         xyz = self.contract_to_unisphere(self._xyz.clone().detach(), torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
-        rendervar = {
-            'means3D': self._xyz,
-            'rotations': torch.nn.functional.normalize(self._rotation),
-            'opacities': torch.sigmoid(self._opacity),
-            'scales': torch.exp(self._scaling),
-            'means2D': torch.zeros_like(self._xyz, requires_grad=True, device="cuda") + 0,
-            'shs': self.mlp_head(torch.cat([self.hash_table(xyz), self.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1).float()
-        }
+        if is_initial_timestep:
+            rendervar = {
+                'means3D': self._xyz,
+                'rotations': torch.nn.functional.normalize(self._rotation),
+                'opacities': torch.sigmoid(self._opacity),
+                'scales': torch.exp(self._scaling),
+                'means2D': torch.zeros_like(self._xyz, requires_grad=True, device="cuda") + 0,
+                'shs': self.mlp_head(torch.cat([self.hash_table(xyz), self.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1).float()
+            }
+        else:
+            rendervar = {
+                'means3D': self._xyz,
+                'rotations': torch.nn.functional.normalize(self._rotation),
+                'opacities': torch.sigmoid(self._opacity),
+                'scales': torch.exp(self._scaling),
+                'means2D': torch.zeros_like(self._xyz, requires_grad=True, device="cuda") + 0,
+                'shs': self.mlp_head(torch.cat([self.hash_table(xyz) + self.get_compensate(xyz), self.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1).float()
+            }
         return rendervar
     
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -200,7 +251,7 @@ class DynamicGaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             group_name = group.get("name", None)
-            if group_name in ["cam_c", "cam_m", "mlp_head", "hash_table"]:
+            if group_name in ["cam_c", "cam_m", "mlp_head", "hash_table", "compensate"]:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -247,7 +298,7 @@ class DynamicGaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             group_name = group.get("name", None)
-            if group_name in ["cam_c", "cam_m", "mlp_head", "hash_table"]:
+            if group_name in ["cam_c", "cam_m", "mlp_head", "hash_table", "compensate"]:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -327,7 +378,8 @@ class DynamicGaussianModel:
                 self.split(grads, grad_thresh)
                 
                 remove_threshold = 0.25 if iteration == 5000 else 0.005
-                to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
+                # to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
+                to_prune = (torch.sigmoid(self._opacity) < remove_threshold).squeeze()
                 if iteration >= 3000:
                     big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
                     to_prune = torch.logical_or(to_prune, big_points_ws)
@@ -337,14 +389,14 @@ class DynamicGaussianModel:
             # if iteration > 0 and iteration % 3000 == 0:
             #     self.reset_opacity()
                 
-        if iteration > op.densify_until_iter:
-            remove_threshold = 0.25 if iteration == 5000 else 0.005
-            to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
-            if iteration >= 3000:
-                big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
-                to_prune = torch.logical_or(to_prune, big_points_ws)
-            self.prune_points(to_prune)
-            torch.cuda.empty_cache()
+        # if iteration > op.densify_until_iter:
+        #     remove_threshold = 0.25 if iteration == 5000 else 0.005
+        #     to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
+        #     if iteration >= 3000:
+        #         big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
+        #         to_prune = torch.logical_or(to_prune, big_points_ws)
+        #     self.prune_points(to_prune)
+        #     torch.cuda.empty_cache()
             
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self._opacity, torch.ones_like(self._opacity) * 0.01))
@@ -367,10 +419,14 @@ class DynamicGaussianModel:
         self.variables["init_bg_rot"] = init_bg_rot.detach()
         self.variables["prev_pts"] = self._xyz.detach()
         self.variables["prev_rots"] = torch.nn.functional.normalize(self._rotation).detach()
-        params_to_fix = ['opacity', 'scaling', 'cam_m', 'cam_c', 'mask']
+        # params_to_fix = ['opacity', 'scaling', 'cam_m', 'cam_c', 'mask']
+        params_to_fix = ['opacity', 'scaling', 'cam_m', 'cam_c', 'mask', 'hash_table']
+        params_to_set = ['compensate']
         for param_group in self.optimizer.param_groups:
             if param_group["name"] in params_to_fix:
                 param_group['lr'] = 0.0
+            elif param_group["name"] in params_to_set:
+                param_group['lr'] = 0.001
             
     def initialize_per_timestep(self):
         pts = self._xyz
@@ -387,6 +443,7 @@ class DynamicGaussianModel:
         self.variables['prev_offset'] = prev_offset.detach()
         self.variables["prev_hash"] = self.hash_table.params.detach()
         self.variables["prev_mlp"] = self.mlp_head.params.detach()
+        self.variables["prev_campensate"] = self.campensate.detach()
         self.variables["prev_pts"] = pts.detach()
         self.variables["prev_rots"] = rot.detach()
 
@@ -407,6 +464,7 @@ class DynamicGaussianModel:
             'cam_c': self._cam_c.detach().cpu().contiguous().numpy(),
             'hash_table': self.hash_table.params.detach().cpu().half().numpy(),
             'mlp_head': self.mlp_head.params.detach().cpu().half().numpy(),
+            'campensate': self.campensate.detach().cpu().contiguous().numpy(),
         }
                 
                 

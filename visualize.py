@@ -48,6 +48,9 @@ def init_camera(y_angle=0., center_dist=2.4, cam_height=1.3, f_ratio=0.82):
 def load_scene_data(seq, exp, seg_as_col=False):
     params = np.load(f"./output/{exp}/{seq}/params.npy", allow_pickle=True).item()
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
+    size = int(params['hash_table'][0].shape[0] / 16)
+    for i in range(params['hash_table'][0].shape[0] - size * 2, params['hash_table'][0].shape[0]):
+        params['hash_table'][0][i] = 0.0
     is_fg = params['seg_color'][:, 0] > 0.5
     scene_data = []
     color_data = []
@@ -300,6 +303,6 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "dynamic-test6"
+    exp_name = "test-no-mask"
     for sequence in ["basketball"]:
         visualize(sequence, exp_name)
