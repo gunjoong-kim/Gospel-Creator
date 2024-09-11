@@ -65,7 +65,18 @@ class DynamicGaussianModel:
         
         self.setup_functions()
         
-        self.compensate = torch.empty(0)
+        #self.compensate = torch.empty(0)
+        self.compensate = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": 16,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 11,
+                "base_resolution": 16,
+                "per_level_scale": 1.447,
+            }
+        )
         self.hash_table = tcnn.Encoding(
                  n_input_dims=3,
                  encoding_config={
@@ -114,7 +125,7 @@ class DynamicGaussianModel:
         
         # for compensation
         # log2_hashmap_size = 14
-        self.campensate = nn.Parameter(torch.tensor(np.zeros((16384, 32))).cuda().float().contiguous().requires_grad_(True))
+        #self.compensate = nn.Parameter(torch.tensor(np.zeros((32768, 32))).cuda().float().contiguous().requires_grad_(True))
         
         cam_centers = np.linalg.inv(md["w2c"][0])[:, :3, 3]
         scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
@@ -134,6 +145,8 @@ class DynamicGaussianModel:
         for params in self.mlp_head.parameters():
             other_params.append(params)
             
+        compensate_params = list(self.compensate.parameters())
+            
         hash_table_params = list(self.hash_table.parameters())
             
         l = [
@@ -146,11 +159,14 @@ class DynamicGaussianModel:
             {'params': [self._cam_m], 'lr': op.cam_m_lr, "name": "cam_m"},
             {'params': [self._cam_c], 'lr': op.cam_c_lr, "name": "cam_c"},
             # for compensation
-            {'params': [self.campensate], 'lr': 0.0, "name": "compensate"},
+            #{'params': [self.compensate], 'lr': 0.0, "name": "compensate"},
         ]
         
         hash_table_lr_groups = {'params': hash_table_params, 'lr': op.net_lr, "name": "hash_table"}
         l.append(hash_table_lr_groups)
+        
+        compensate_params_lr_groups = {'params': compensate_params, 'lr': 0.0, "name": "compensate"}
+        l.append(compensate_params_lr_groups)
         
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.optimizer_net = torch.optim.Adam(other_params, lr=op.net_lr, eps=1e-15)
@@ -205,8 +221,8 @@ class DynamicGaussianModel:
             return x
         
     def get_compensate(self, xyz):
-        hash_vals = hash(xyz, 16384)
-        return self.campensate[hash_vals]
+        hash_vals = hash(xyz, 32768)
+        return self.compensate[hash_vals]
             
     def get_rendervar(self, cam, is_initial_timestep=False):
         dir_pp = (self._xyz - cam.campos.repeat(self._xyz.shape[0], 1))
@@ -228,7 +244,7 @@ class DynamicGaussianModel:
                 'opacities': torch.sigmoid(self._opacity),
                 'scales': torch.exp(self._scaling),
                 'means2D': torch.zeros_like(self._xyz, requires_grad=True, device="cuda") + 0,
-                'shs': self.mlp_head(torch.cat([self.hash_table(xyz) + self.get_compensate(xyz), self.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1).float()
+                'shs': self.mlp_head(torch.cat([self.hash_table(xyz) + self.compensate(xyz), self.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1).float()
             }
         return rendervar
     
@@ -378,8 +394,8 @@ class DynamicGaussianModel:
                 self.split(grads, grad_thresh)
                 
                 remove_threshold = 0.25 if iteration == 5000 else 0.005
-                # to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
-                to_prune = (torch.sigmoid(self._opacity) < remove_threshold).squeeze()
+                to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
+                # to_prune = (torch.sigmoid(self._opacity) < remove_threshold).squeeze()
                 if iteration >= 3000:
                     big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
                     to_prune = torch.logical_or(to_prune, big_points_ws)
@@ -389,14 +405,14 @@ class DynamicGaussianModel:
             # if iteration > 0 and iteration % 3000 == 0:
             #     self.reset_opacity()
                 
-        # if iteration > op.densify_until_iter:
-        #     remove_threshold = 0.25 if iteration == 5000 else 0.005
-        #     to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
-        #     if iteration >= 3000:
-        #         big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
-        #         to_prune = torch.logical_or(to_prune, big_points_ws)
-        #     self.prune_points(to_prune)
-        #     torch.cuda.empty_cache()
+        if iteration > op.densify_until_iter:
+            remove_threshold = 0.25 if iteration == 5000 else 0.005
+            to_prune = torch.logical_or((torch.sigmoid(self._mask) < 0.01).squeeze(), (torch.sigmoid(self._opacity) < remove_threshold).squeeze())
+            if iteration >= 3000:
+                big_points_ws = torch.exp(self._scaling).max(dim=1).values > 0.1 * self.variables['scene_radius']
+                to_prune = torch.logical_or(to_prune, big_points_ws)
+            self.prune_points(to_prune)
+            torch.cuda.empty_cache()
             
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self._opacity, torch.ones_like(self._opacity) * 0.01))
@@ -426,7 +442,7 @@ class DynamicGaussianModel:
             if param_group["name"] in params_to_fix:
                 param_group['lr'] = 0.0
             elif param_group["name"] in params_to_set:
-                param_group['lr'] = 0.001
+                param_group['lr'] = 0.03
             
     def initialize_per_timestep(self):
         pts = self._xyz
@@ -443,7 +459,7 @@ class DynamicGaussianModel:
         self.variables['prev_offset'] = prev_offset.detach()
         self.variables["prev_hash"] = self.hash_table.params.detach()
         self.variables["prev_mlp"] = self.mlp_head.params.detach()
-        self.variables["prev_campensate"] = self.campensate.detach()
+        self.variables["prev_campensate"] = self.compensate.params.detach()
         self.variables["prev_pts"] = pts.detach()
         self.variables["prev_rots"] = rot.detach()
 
@@ -464,7 +480,7 @@ class DynamicGaussianModel:
             'cam_c': self._cam_c.detach().cpu().contiguous().numpy(),
             'hash_table': self.hash_table.params.detach().cpu().half().numpy(),
             'mlp_head': self.mlp_head.params.detach().cpu().half().numpy(),
-            'campensate': self.campensate.detach().cpu().contiguous().numpy(),
+            'compensate': self.compensate.params.detach().cpu().numpy(),
         }
                 
                 
