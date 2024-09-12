@@ -26,7 +26,7 @@ FORCE_LOOP = False  # False or True
 
 w, h = 640, 360
 near, far = 0.01, 100.0
-view_scale = 3.9
+view_scale = 2.0
 fps = 20
 traj_frac = 25  # 4% of points
 traj_length = 15
@@ -84,8 +84,20 @@ def load_scene_data(seq, exp, seg_as_col=False):
                     "n_hidden_layers": 2,
                 },
             )
-        recolor.params = torch.nn.Parameter(params["hash_table"][t].cuda().half())
+        compensate = tcnn.Encoding(
+                n_input_dims=3,
+                encoding_config={
+                "otype": "HashGrid",
+                "n_levels": 16,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 11,
+                "base_resolution": 16,
+                "per_level_scale": 1.447,
+            }
+        )
+        recolor.params = torch.nn.Parameter(params["hash_table"][0].cuda().half())
         mlp_head.params = torch.nn.Parameter(params["mlp_head"][t].cuda().half())
+        compensate.params = torch.nn.Parameter(params["compensate"][t].cuda().half())
         rendervar = {
             'means3D': params['xyz'][t],
             # 'colors_precomp': params['rgb_colors'][t] if not seg_as_col else params['seg_colors'],
@@ -97,7 +109,8 @@ def load_scene_data(seq, exp, seg_as_col=False):
         colorvar = {
             'mlp_head': mlp_head,
             'recolor': recolor,
-            "direction_encoding": direction_encoding
+            "direction_encoding": direction_encoding,
+            "compensate": compensate
         }
         if REMOVE_BACKGROUND:
             rendervar = {k: v[is_fg] for k, v in rendervar.items()}
@@ -179,7 +192,7 @@ def render(w2c, k, timestep_data, color_data):
         dir_pp = (timestep_data["means3D"] - cam.campos.repeat(timestep_data["means3D"].shape[0], 1))
         dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
         xyz = contract_to_unisphere(timestep_data["means3D"].clone().detach(), torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
-        timestep_data["shs"] = (color_data["mlp_head"])(torch.cat([color_data["recolor"](xyz), color_data["direction_encoding"](dir_pp)], dim=-1)).unsqueeze(1).float()
+        timestep_data["shs"] = (color_data["mlp_head"])(torch.cat([color_data["recolor"](xyz) + color_data["compensate"](xyz), color_data["direction_encoding"](dir_pp)], dim=-1)).unsqueeze(1).float()
         im, _, depth, = Renderer(raster_settings=cam)(**timestep_data)
         return im, depth
 
@@ -303,6 +316,6 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "test-no-mask"
+    exp_name = "compensate-test-instant-ngp-11-0.03-prune-30timestep"
     for sequence in ["basketball"]:
         visualize(sequence, exp_name)

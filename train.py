@@ -66,11 +66,7 @@ def get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op):
     if is_initial_timestep:
         losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im'])) + op.lambda_mask * torch.mean((torch.sigmoid(dynamic_gaussians._mask)))
     else:
-        compensate_penalty = 0.0
-        for param in dynamic_gaussians.compensate.parameters():
-            compensate_penalty += torch.sum(torch.abs(param))
-        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im'])) + 0.01 * compensate_penalty
-    # losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))    
+        losses['im'] = (1 - op.lambda_dssim) * l1_loss_v1(im, curr_data['im']) + op.lambda_dssim * (1.0 - calc_ssim(im, curr_data['im']))
     
     dynamic_gaussians.variables['means2D'] = rendervar['means2D']
     segrendervar = dynamic_gaussians.get_rendervar(curr_data['cam'], is_initial_timestep)
@@ -199,7 +195,7 @@ def train(seq, exp):
     dynamic_gaussians.training_setup(op)
     
     num_timesteps = len(md_train['fn'])
-    num_timesteps = 5
+    num_timesteps = 30
     for t in range(num_timesteps):
         dataset = get_dataset(t, md_train, seq)
         todo_dataset = []
@@ -235,7 +231,7 @@ def train(seq, exp):
     
     
 if __name__=="__main__":
-    exp_name = "compensate-test-instant-ngp-11-0.03-prune-penalty-0.01"
+    exp_name = "compensate-test-instant-ngp-11-0.03-prune-penalty-0.01-half"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)
