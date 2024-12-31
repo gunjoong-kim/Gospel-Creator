@@ -316,6 +316,6 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "compensate-test-instant-ngp-11-0.03-prune-30timestep"
+    exp_name = "gradient-test"
     for sequence in ["basketball"]:
         visualize(sequence, exp_name)

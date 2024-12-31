@@ -246,7 +246,7 @@ def train_with_dynamic(seq, exp):
     dynamic_gaussians.training_setup(op)
     
     num_timesteps = len(md_train['fn'])
-    num_timesteps = 5  # 예시로 5로 제한
+    num_timesteps = 33  # 예시로 5로 제한
 
     # grad_xyz_list: 최종적으로 "각 타임스텝별 평균 gradient"를 담는 리스트
     #  - t=0은 제외하고(t=1부터) 저장한다.
@@ -330,8 +330,8 @@ def train_with_dynamic(seq, exp):
 
     
 if __name__=="__main__":
-    exp_name = "graidient-test"
+    exp_name = "graidient-test-33"
     
     for sequence in ["basketball"]:
-        train(sequence, exp_name)
+        train_with_dynamic(sequence, exp_name)
         torch.cuda.empty_cache()
