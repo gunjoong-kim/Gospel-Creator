@@ -226,12 +226,111 @@ def train(seq, exp):
         output_params.append(dynamic_gaussians.capture())
         evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
     save_params(output_params, seq, exp)
+
+def train_with_dynamic(seq, exp):
+    output_params = []
+    mp = ModelParams()
+    op = OptimizationParams()
+
+    if os.path.exists(f"./output/{exp}/{seq}"):
+        print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
+        return
     
+    # metadata loading
+    md_train = json.load(open(f"./data/{seq}/train_meta.json", "r"))
+    md_test = json.load(open(f"./data/{seq}/test_meta.json", "r"))
+
+    # model initialization
+    dynamic_gaussians = DynamicGaussianModel(mp)
+    dynamic_gaussians.load_initial_pt_cld_and_init(seq, md_train)
+    dynamic_gaussians.training_setup(op)
+    
+    num_timesteps = len(md_train['fn'])
+    num_timesteps = 5  # 예시로 5로 제한
+
+    # grad_xyz_list: 최종적으로 "각 타임스텝별 평균 gradient"를 담는 리스트
+    #  - t=0은 제외하고(t=1부터) 저장한다.
+    grad_xyz_list = []
+    
+    for t in range(num_timesteps):
+        dataset = get_dataset(t, md_train, seq)
+        todo_dataset = []
+        is_initial_timestep = (t == 0)
+        if not is_initial_timestep:
+            dynamic_gaussians.initialize_per_timestep()
+
+        # 한 타임스텝 내에서 러닝(누적) 합/평균 계산을 위한 변수
+        iter_grad_xyz_sum = None
+        iter_count = 0
+
+        num_iter_per_timestep = op.initial_step_iter if is_initial_timestep else op.not_initial_step_iter
+        progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
+        
+        for i in range(num_iter_per_timestep):
+            curr_data = get_batch_random(todo_dataset, dataset)
+            loss = get_loss(dynamic_gaussians, curr_data, is_initial_timestep, op)
+            loss.backward()
+            
+            # ---------- iteration마다 \_xyz의 gradient 누적 ----------
+            if dynamic_gaussians._xyz.grad is not None and not is_initial_timestep and i < 30:
+                grad_xyz = dynamic_gaussians._xyz.grad.detach().cpu().numpy()  # (N, 3) shape
+
+                # (1) 아직 iter_grad_xyz_sum이 없다면 (첫 iteration), 동일 shape의 0 array 생성
+                if iter_grad_xyz_sum is None:
+                    iter_grad_xyz_sum = np.zeros_like(grad_xyz)
+
+                # (2) 누적
+                #     prune/clone/split 등으로 인해 shape이 바뀌면 에러가 날 수 있음.
+                #     이 경우에는 매 iteration 사이에서 point의 개수가 달라지기 때문.
+                #     만약 그런 경우라면, "각 iteration 직후 shape이 달라지지 않는 구간"에서만 평균 내야 합니다.
+                iter_grad_xyz_sum += grad_xyz
+                iter_count += 1
+            # ---------------------------------------------------------
+            
+            with torch.no_grad():
+                report_progress(dynamic_gaussians, dataset[0], i, progress_bar)
+                if is_initial_timestep:
+                    dynamic_gaussians.densify_with_learnable_mask(i, op)
+                
+                dynamic_gaussians.optimizer.step()
+                dynamic_gaussians.optimizer.zero_grad(set_to_none=True)
+                dynamic_gaussians.optimizer_net.step()
+                dynamic_gaussians.optimizer_net.zero_grad(set_to_none=True)
+                dynamic_gaussians.scheduler_net.step()
+        
+        if is_initial_timestep:
+            dynamic_gaussians.initialize_post_first_timestep()
+
+        progress_bar.close()
+        
+        # ----- 한 타임스텝이 끝난 뒤 (t=0은 건너뛰고), 평균 gradient 계산 -----
+        if t > 0:  # t=0(첫 타임스텝)은 스킵
+            if iter_grad_xyz_sum is not None and iter_count > 0:
+                # 평균
+                grad_xyz_avg = iter_grad_xyz_sum / iter_count  # shape: (N,3)
+                grad_xyz_list.append(grad_xyz_avg)
+            else:
+                # 혹은 None을 append하거나, 원하는 대로 처리
+                grad_xyz_list.append(None)
+        # -------------------------------------------------------------------
+
+        # 시각적 평가 및 파라미터 저장
+        output_params.append(dynamic_gaussians.capture())
+        evaluate_psnr_and_save_image(dynamic_gaussians, md_test, md_train, t, seq, exp)
+    
+    # 모든 timestep이 끝난 후 파라미터 저장
+    save_params(output_params, seq, exp)
+    
+    # grad_xyz_list를 numpy 형태로 변환하여 저장
+    #  - t=1~4에 해당하는 (N, 3) 배열들이 들어 있음 (처음 타임스텝은 스킵)
+    #  - prune/split 때문에 shape이 매 타임스텝마다 다르다면 np.stack 불가
+    #    -> allow_pickle=True 설정, 또는 별도 파일 등으로 저장
+    np.save(f"./output/{exp}/{seq}/grad_xyz_avg_per_timestep.npy", grad_xyz_list, allow_pickle=True)
+    # ----------------------------------------------------------------------
 
     
-    
 if __name__=="__main__":
-    exp_name = "compensate-test-instant-ngp-11-0.03-prune-penalty-0.01-half"
+    exp_name = "graidient-test"
     
     for sequence in ["basketball"]:
         train(sequence, exp_name)

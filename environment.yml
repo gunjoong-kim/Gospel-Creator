@@ -1,4 +1,4 @@
-name: d3dg_enhanced
+name: gospel_creator
 channels:
   - pytorch
   - conda-forge

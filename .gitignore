@@ -2,6 +2,7 @@ __pycache__/
 .idea/
 data/
 output/
+bin_output/
 data.zip
 output.zip
 diff-gaussian-rasterization-w-depth/
